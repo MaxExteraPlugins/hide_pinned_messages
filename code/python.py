@@ -2,15 +2,89 @@ __id__ = "hide_pinned_messages"
 __name__ = "HidePins"
 __description__ = "Скрывает панель закреплённых сообщений в чатах"
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "1.0.3"
+__version__ = "1.0.5"
 __min_version__ = "12.10.6"
 __icon__ = "MaxExteraPluginsStickers/2"
 
+import json
 from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
 from hook_utils import find_class, get_private_field
-from ui.settings import Header, Switch, Divider
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Divider, Custom, SimpleSettingFactory
+from ui.bulletin import BulletinHelper
+from java import dynamic_proxy, jclass
 
 VIEW_GONE = 8
+
+
+class L:
+    _STRINGS = {
+        "header_hide_pins": {
+            "ru": "Скрыть закреплённые сообщения",
+            "en": "Hide pinned messages",
+        },
+        "private_chats": {
+            "ru": "Личные чаты",
+            "en": "Private Chats",
+        },
+        "groups": {
+            "ru": "Группы",
+            "en": "Groups",
+        },
+        "channels": {
+            "ru": "Каналы",
+            "en": "Channels",
+        },
+        "state_on": {
+            "ru": "Вкл",
+            "en": "On",
+        },
+        "state_off": {
+            "ru": "Выкл",
+            "en": "Off",
+        },
+        "divider_hint": {
+            "ru": "Нажмите на пункт, чтобы настроить исключения. Требуется перезаход в чат для применения.",
+            "en": "Tap an item to configure exceptions. Re-entering the chat is required to apply.",
+        },
+        "exceptions_updated": {
+            "ru": "Исключения обновлены",
+            "en": "Exceptions updated",
+        },
+    }
+
+    @staticmethod
+    def is_ru() -> bool:
+        try:
+            from org.telegram.messenger import LocaleController
+            lang = str(LocaleController.getInstance().getCurrentLocale().getLanguage() or "").lower()
+            return lang in ("ru", "be", "uk", "kk")
+        except Exception:
+            return True
+
+    @classmethod
+    def g(cls, key: str) -> str:
+        entry = cls._STRINGS.get(key, {})
+        if cls.is_ru():
+            return entry.get("ru", entry.get("en", key))
+        return entry.get("en", key)
+
+    @classmethod
+    def exceptions_count(cls, n: int) -> str:
+        if cls.is_ru():
+            mod10 = n % 10
+            mod100 = n % 100
+            if mod10 == 1 and mod100 != 11:
+                word = "исключение"
+            elif 2 <= mod10 <= 4 and not (12 <= mod100 <= 14):
+                word = "исключения"
+            else:
+                word = "исключений"
+            return f"{n} {word}"
+        word = "exception" if n == 1 else "exceptions"
+        return f"{n} {word}"
+
 
 def detect_chat_type(chat_activity):
     try:
@@ -27,20 +101,43 @@ def detect_chat_type(chat_activity):
     return "unknown"
 
 
-def detect_peer_type(peer):
-    if peer is None:return "unknown"
+def detect_peer_info(peer):
+    if peer is None:
+        return "unknown", None
 
     try:
         name = type(peer).__name__
         if "PeerUser" in name:
-            return "private"
+            uid = getattr(peer, "user_id", None)
+            return "private", (int(uid) if uid else None)
         if "PeerChat" in name:
-            return "group"
+            cid = getattr(peer, "chat_id", None)
+            return "group", (-int(cid) if cid else None)
         if "PeerChannel" in name:
-            return "channel"
+            cid = getattr(peer, "channel_id", None)
+            return "channel", (-int(cid) if cid else None)
     except Exception:
         pass
 
+    return "unknown", None
+
+
+def detect_dialog_type(dialog_id, controller=None):
+    try:
+        did = int(dialog_id)
+        if did > 0:
+            return "private"
+        if did < 0 and controller is not None:
+            from java.lang import Long as JLong
+            mc = controller.getMessagesController()
+            if mc is not None:
+                chat = mc.getChat(JLong(-did))
+                if chat is not None:
+                    if getattr(chat, "broadcast", False) and not getattr(chat, "megagroup", False):
+                        return "channel"
+                    return "group"
+    except Exception:
+        pass
     return "unknown"
 
 
@@ -54,7 +151,12 @@ class PinnedViewHook(MethodHook):
             if activity is None:
                 return
             chat_type = detect_chat_type(activity)
-            if not self.plugin.should_hide(chat_type):
+            dialog_id = None
+            try:
+                dialog_id = int(activity.getDialogId())
+            except Exception:
+                pass
+            if not self.plugin.should_hide(chat_type, dialog_id):
                 return
             for name in ["pinnedMessageView", "pinnedMessageContainer", "topChatPanelView"]:
                 v = get_private_field(activity, name)
@@ -74,10 +176,25 @@ class LoadPinnedHook(MethodHook):
 
     def before_hooked_method(self, param):
         try:
-            if (self.plugin.get_setting("hide_private", True)
-                    and self.plugin.get_setting("hide_groups", True)
-                    and self.plugin.get_setting("hide_channels", True)):
-                param.setResult(None)
+            args = param.args
+            if args is None or len(args) == 0:
+                return
+            dialog_id = int(args[0])
+            chat_type = detect_dialog_type(dialog_id, param.thisObject)
+            if chat_type == "unknown":
+                if (self.plugin.get_setting("hide_private", True)
+                        and self.plugin.get_setting("hide_groups", True)
+                        and self.plugin.get_setting("hide_channels", True)
+                        and not self.plugin._has_any_exceptions()):
+                    if len(args) == 3:
+                        param.setResult(None)
+                return
+            if self.plugin.should_hide(chat_type, dialog_id):
+                if len(args) == 3:
+                    param.setResult(None)
+                else:
+                    from java.util import ArrayList
+                    param.setResult(ArrayList())
         except Exception:
             pass
 
@@ -646,20 +763,61 @@ class AuthorChannelHelper:
 
 class Plugin(BasePlugin):
 
+    _CATEGORY_META = {
+        "private": ("hide_private", "private_chats", "msg_openprofile"),
+        "group": ("hide_groups", "groups", "msg_groups"),
+        "channel": ("hide_channels", "channels", "msg_channel"),
+    }
+
     def on_app_event(self, event_type):
         if hasattr(self, "_author_helper"):
             self._author_helper.on_event(event_type)
 
-    def should_hide(self, chat_type):
-        if chat_type == "private":
-            return self.get_setting("hide_private", True)
-        if chat_type == "group":
-            return self.get_setting("hide_groups", True)
-        if chat_type == "channel":
-            return self.get_setting("hide_channels", True)
-        return True
+    def _get_exceptions(self, chat_type):
+        if chat_type not in self._CATEGORY_META:
+            return set()
+        cache = getattr(self, "_exceptions_cache", None)
+        if cache is None:
+            self._exceptions_cache = {}
+            cache = self._exceptions_cache
+        if chat_type not in cache:
+            raw = self.get_setting(f"exceptions_{chat_type}", "[]")
+            try:
+                data = json.loads(raw) if raw else []
+                cache[chat_type] = set(int(x) for x in data)
+            except Exception:
+                cache[chat_type] = set()
+        return cache[chat_type]
+
+    def _save_exceptions(self, chat_type, ids_set):
+        if not hasattr(self, "_exceptions_cache"):
+            self._exceptions_cache = {}
+        cleaned = set(int(x) for x in ids_set if x)
+        self._exceptions_cache[chat_type] = cleaned
+        self.set_setting(f"exceptions_{chat_type}", json.dumps(sorted(cleaned)))
+
+    def _has_any_exceptions(self):
+        return any(len(self._get_exceptions(c)) > 0 for c in self._CATEGORY_META)
+
+    def should_hide(self, chat_type, dialog_id=None):
+        meta = self._CATEGORY_META.get(chat_type)
+        if meta is None:
+            return True
+        setting_key = meta[0]
+        base = bool(self.get_setting(setting_key, True))
+        if dialog_id is not None:
+            try:
+                did = int(dialog_id)
+                if did in self._get_exceptions(chat_type):
+                    return not base
+            except Exception:
+                pass
+        return base
 
     def on_plugin_load(self):
+        self._exceptions_cache = {}
+        self._touch_x = {}
+        self._notif_factory = None
         self._author_helper = AuthorChannelHelper(self, icon_sticker="MaxExteraPluginsStickers/2")
         self._author_helper.on_load()
         try:
@@ -685,18 +843,197 @@ class Plugin(BasePlugin):
     def on_plugin_unload(self):
         if hasattr(self, "_author_helper"):
             self._author_helper.on_unload()
-        pass
+        factory = getattr(self, "_notif_factory", None)
+        if factory is not None:
+            try:
+                factory.release()
+            except Exception:
+                pass
+            self._notif_factory = None
 
     def on_update_hook(self, update_name, account, update):
         try:
             if update_name in ("TL_updatePinnedMessages", "TL_updatePinnedChannelMessages"):
                 peer = getattr(update, "peer", None)
-                chat_type = detect_peer_type(peer)
-                if self.should_hide(chat_type):
+                chat_type, dialog_id = detect_peer_info(peer)
+                if self.should_hide(chat_type, dialog_id):
                     return HookResult(strategy=HookStrategy.CANCEL)
         except Exception:
             pass
         return HookResult()
+
+    def _format_subtext(self, chat_type, enabled):
+        state = L.g("state_on") if enabled else L.g("state_off")
+        count = len(self._get_exceptions(chat_type))
+        if count > 0:
+            return f"{state}, {L.exceptions_count(count)}"
+        return state
+
+    def _get_notif_factory(self):
+        factory = getattr(self, "_notif_factory", None)
+        if factory is not None:
+            return factory
+
+        plugin = self
+        if not hasattr(self, "_touch_x"):
+            self._touch_x = {}
+
+        from android.view import View, MotionEvent
+        from java.lang import System
+        from org.telegram.messenger import R as TgR
+        from org.telegram.ui.Cells import NotificationsCheckCell
+
+        class TouchTracker(dynamic_proxy(View.OnTouchListener)):
+            def onTouch(t_self, v, event):
+                try:
+                    action = event.getActionMasked()
+                    if action == MotionEvent.ACTION_DOWN or action == MotionEvent.ACTION_UP:
+                        plugin._touch_x[System.identityHashCode(v)] = float(event.getX())
+                except Exception:
+                    pass
+                return False
+
+        def create_view(context, list_view, current_account, class_guid, resources_provider):
+            cell = NotificationsCheckCell(context, 21, 70, True, resources_provider)
+            cell.setOnTouchListener(TouchTracker())
+            return cell
+
+        def bind_view(view, item, divider, adapter, list_view):
+            try:
+                cat = str(item.object) if item.object is not None else "private"
+                meta = plugin._CATEGORY_META.get(cat, plugin._CATEGORY_META["private"])
+                setting_key, label_key, icon_name = meta
+                checked = bool(plugin.get_setting(setting_key, True))
+                icon_res = getattr(TgR.drawable, icon_name, 0)
+                subtext = plugin._format_subtext(cat, checked)
+                view.setAnimationsEnabled(False)
+                view.setTextAndValueAndIconAndCheck(
+                    L.g(label_key),
+                    subtext,
+                    icon_res,
+                    checked,
+                    0,
+                    False,
+                    bool(divider),
+                    False,
+                )
+                view.setAnimationsEnabled(True)
+            except Exception:
+                pass
+
+        def on_factory_click(plugin_java, item, view):
+            try:
+                cat = str(item.object) if item is not None and item.object is not None else "private"
+                plugin._on_category_click(cat, view)
+            except Exception:
+                pass
+
+        self._notif_factory = SimpleSettingFactory(
+            create_view,
+            bind_view,
+            is_clickable=True,
+            is_shadow=False,
+            on_click=on_factory_click,
+        )
+        return self._notif_factory
+
+    def _on_category_click(self, chat_type, view=None):
+        meta = self._CATEGORY_META.get(chat_type)
+        if meta is None:
+            return
+        setting_key = meta[0]
+
+        tapped_switch = False
+        if view is not None:
+            try:
+                from java.lang import System
+                from org.telegram.messenger import AndroidUtilities, LocaleController
+                x = getattr(self, "_touch_x", {}).get(System.identityHashCode(view), None)
+                w = view.getMeasuredWidth()
+                if x is not None and w > 0:
+                    dp76 = AndroidUtilities.dp(76)
+                    is_rtl = bool(LocaleController.isRTL)
+                    if (is_rtl and x <= dp76) or (not is_rtl and x >= w - dp76):
+                        tapped_switch = True
+            except Exception:
+                pass
+
+        if tapped_switch:
+            new_val = not bool(self.get_setting(setting_key, True))
+            self.set_setting(setting_key, new_val)
+            try:
+                view.setChecked(new_val)
+                view.setValue(self._format_subtext(chat_type, new_val))
+            except Exception:
+                pass
+        else:
+            self._open_exceptions_picker(chat_type, view)
+
+    def _open_exceptions_picker(self, chat_type, cell_view=None):
+        plugin = self
+
+        def _ui():
+            try:
+                frag = get_last_fragment()
+                if frag is None:
+                    return
+
+                USA = jclass("org.telegram.ui.UsersSelectActivity")
+                DelCls = jclass("org.telegram.ui.UsersSelectActivity$FilterUsersActivityDelegate")
+                from java.util import ArrayList
+                from java.lang import Long as JLong
+
+                preselected = ArrayList()
+                for did in sorted(plugin._get_exceptions(chat_type)):
+                    preselected.add(JLong(int(did)))
+
+                act = USA(False, preselected, 0)
+                if chat_type == "private":
+                    try:
+                        act.asPrivateChats()
+                    except Exception:
+                        pass
+                try:
+                    act.noChatTypes = True
+                except Exception:
+                    pass
+                try:
+                    act.doNotNewChats = True
+                except Exception:
+                    pass
+
+                class PickerDelegate(dynamic_proxy(DelCls)):
+                    def didSelectChats(s_self, dids, flags):
+                        try:
+                            new_ids = set()
+                            if dids is not None:
+                                for i in range(dids.size()):
+                                    try:
+                                        did = int(dids.get(i))
+                                        if did != 0:
+                                            new_ids.add(did)
+                                    except Exception:
+                                        pass
+                            def apply_saved():
+                                plugin._save_exceptions(chat_type, new_ids)
+                                if cell_view is not None:
+                                    try:
+                                        setting_key = plugin._CATEGORY_META[chat_type][0]
+                                        checked = bool(plugin.get_setting(setting_key, True))
+                                        cell_view.setValue(plugin._format_subtext(chat_type, checked))
+                                    except Exception:
+                                        pass
+                                BulletinHelper.show_info(L.g("exceptions_updated"))
+                            run_on_ui_thread(apply_saved)
+                        except Exception:
+                            pass
+
+                act.setDelegate(PickerDelegate())
+                frag.presentFragment(act)
+            except Exception:
+                pass
+
+        run_on_ui_thread(_ui)
 
     def create_settings(self):
         try:
@@ -708,24 +1045,22 @@ class Plugin(BasePlugin):
         return items
 
     def _inner_create_settings(self):
+        factory = self._get_notif_factory()
         return [
-            Header(text="Скрыть закреплённые сообщения"),
-            Switch(
-                key="hide_private",
-                text="В личных чатах",
-                default=True,
+            Header(text=L.g("header_hide_pins")),
+            Custom(
+                factory=factory.instance.java,
+                factory_args="private",
             ),
-            Switch(
-                key="hide_groups",
-                text="В группах",
-                default=True,
+            Custom(
+                factory=factory.instance.java,
+                factory_args="group",
             ),
-            Switch(
-                key="hide_channels",
-                text="В каналах",
-                default=True,
+            Custom(
+                factory=factory.instance.java,
+                factory_args="channel",
             ),
             Divider(
-                text="Требуется перезаход в чат для применения.",
+                text=L.g("divider_hint"),
             ),
         ]
