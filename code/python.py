@@ -2,7 +2,7 @@ __id__ = "hide_pinned_messages"
 __name__ = "HidePins"
 __description__ = "Скрывает панель закреплённых сообщений в чатах"
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 __min_version__ = "12.10.6"
 __icon__ = "MaxExteraPluginsStickers/2"
 
